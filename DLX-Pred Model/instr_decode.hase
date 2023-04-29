@@ -1,0 +1,868 @@
+// Project:	DLX  V4
+// Entity	Instruction Decode Unit
+// File		instr_decode.hase
+// Date:	27 December 2002
+
+// The Instruction Decode Unit receives instruction packets from the
+// Instruction Fetch Unit into its Instruction Register and sends
+// instruction/operand packets to the Execution Units. It accesses register
+// operands from the Register Units. It also accesses the Registers Unit
+// to detect possible WAW and/or RAW hazards and the Scoreboard to detect
+// possible Structural and Control Hazards.
+// If a hazard is detected, the Unit is Held and the instruction remains
+// in the Instruction Register until the next clock, when the checks are
+// repeated.
+
+$class_decls
+
+//entity references
+
+  sim_entity_id pipe;
+
+  scoreboard * mySB;
+  registers * myReg;
+  mem_access * myMA;
+  
+// structures and variables
+  t_instrn_reg ID_Input_RegA, ID_Input_RegB, InputPacket, instr, temp_buff1;
+  unit_data_struct ID_OutputA, ID_OutputB;
+  t_reg_args dest_args, src1_args, src2_args;	// structures for holding
+						// decoded register arguments
+  t_reg_read read_src1, read_src2;
+  t_reg_value src1_value, src2_value;
+  set_dest_busy_struct set_dest_busy_pkt;
+
+  bool Hold;
+  bool IDHeld;
+  bool Hazard, Hazard_A, Hazard_B;
+  bool DelaySlot;
+  bool SetA_DestBusy, SetB_DestBusy;
+  bool FirstCycle, SecondCycle;		// of Double Order
+  bool SetClearValid, ClearValid;
+
+  char  A_Dest[8], B_Dest[8], Source1[8], Source2[8];
+  char A_destT, A_src1T, A_src2T;   // source1, source2, destination reg types
+  char B_destT, B_src1T, B_src2T;   // source1, source2, destination reg types
+  int A_dest, A_src1, A_src2;	  // source1, source2, destination reg numbers
+  int B_dest, B_src1, B_src2;	  // source1, source2, destination reg numbers
+  int A_dest_regs, A_source_regs;	// no of A dest and source registers
+  int B_dest_regs, B_source_regs;	// no of B dest and source registers
+  int Checkhaz;			// output of hazard check in Scoreboard
+  int old_state;
+
+  
+//classes
+
+  void ClearPipe();
+
+$class_defs
+
+void instr_decode::ClearPipe()
+{
+	SetClearValid = true;
+}
+
+$pre
+
+pipe = sim.get_entity_id("PIPE_DISP");
+
+// set up pointers to other entities
+
+myReg = (registers*)sim.get_entity(sim.get_entity_id("REGISTERS")); 
+mySB = (scoreboard*)sim.get_entity(sim.get_entity_id("SCOREBOARD"));
+myMA = (mem_access*)sim.get_entity(sim.get_entity_id("MEM_ACCESS"));
+
+Hold = false;
+IDHeld = false;
+Hazard = false;
+Hazard_A = false;
+Hazard_B = false;
+DelaySlot = false;
+SetA_DestBusy = false;
+SetClearValid = false;
+ClearValid = false;
+FirstCycle = false;
+SecondCycle = false;
+
+Checkhaz = 0;
+
+ID_Input_RegA.status = 0;
+InputPacket.status = 0;
+
+my_state = ID_VOID;
+old_state = ID_VOID;
+dump_state();
+
+$phase0
+
+
+// predicates for use in sim_waiting test
+
+  sim_from_port instr_packetA(instr_inA);	    
+  sim_from_port instr_packetB(instr_inB);	    
+
+// DEAL WITH INPUT
+
+// If IDHold or Hazard is set, no packet will have been sent to this unit
+// and no packets must be sent to execution units
+// If ID Hold is set, current instruction must not be processed
+
+
+	if  ((!Hazard_A && !Hazard_B && !Hold) || ClearValid)
+	 {
+	  ID_Input_RegA.status = 0;		// initialise to nonvalid
+	 if  ((sim_waiting(instr_packetA) > 0)
+	 &&   (sim_waiting(instr_packetB) > 0))
+	 {
+	  sim_select(instr_packetA, ev);
+	 SIM_CAST( t_instrn_reg, InputPacket, ev );
+	 ID_Input_RegA.status = InputPacket.status;
+	 ID_Input_RegA.instrn = InputPacket.instrn;
+
+	  sim_select(instr_packetB, ev);
+	  SIM_CAST( t_instrn_reg, InputPacket, ev );
+	  ID_Input_RegB.status = InputPacket.status;
+	  ID_Input_RegB.instrn = InputPacket.instrn;
+	 }
+	 if ((ID_Input_RegA.status & 5) == 5)
+	   {DelaySlot = true;}
+
+
+// At a pipeline clear, ClearValid flag is set which says all instructions
+// must be set invalid until one arrives with bit 28 set indicating first of
+// new sequence. This bit resets ClearValid.
+
+	  if ((ID_Input_RegA.status & 9) == 9)	// bits 31 and 28 = 1
+	   {ClearValid = false;}
+
+	}	// end of Hold, etc
+	if (ClearValid)
+	 {ID_Input_RegA.status = 0;}
+
+// send packet to pipeline display
+
+		sim_schedule(pipe, 0.0, INSTRUCTION,
+			SIM_PUT(t_instrn_reg, ID_Input_RegA));
+		sim_schedule(pipe, 0.0, INSTRUCTION,
+			SIM_PUT(t_instrn_reg, ID_Input_RegB));
+
+     if ((ID_Input_RegA.status & 1) == 0)
+	{my_state = ID_VOID;}
+	
+     if (((ID_Input_RegA.status & 1) == 1) && !Hold)
+	{my_state = ID_BUSY;}
+
+     if (((ID_Input_RegA.status & 1) == 1) && Hold)
+	{my_state = ID_HELD;}
+	
+	if (my_state != old_state)
+	 {dump_state();
+	  old_state = my_state;
+	 }
+     if (((ID_Input_RegA.status & 1) == 1) && !Hold)
+	{
+// At this point there is a valid new instruction in ID_Input_Reg
+// or a previous instruction that was held up
+
+// DEAL WITH DOUBLE CYCLE ORDERS
+// First cycle:
+// Set bit 29 = 1 in ID_Output_RegA.status 
+// (Used in MA: first phase does not increment PC (PCinc = ~bit 29))
+// Set FirstCycle = true 
+// In Clock phase1, copy FirstCycle to SecondCycle (holds up next order)
+//
+// Second cycle:
+// Set bit 30 = 1 in ID_Output_RegA.status
+// (Used in WB to increment register address)
+
+
+// check/re-check for data and/or structural hazards
+
+// check for data hazards
+	
+	mySB->resetWAW_A();
+	mySB->resetRAW1_A();
+	mySB->resetRAW2_A();
+
+	mySB->resetWAW_B();
+	mySB->resetRAW1_B();
+	mySB->resetRAW2_B();
+
+	Hazard_A = false;
+	Hazard_B = false;
+
+// CHANNEL A
+
+// check if WAW is clear
+
+  if (ID_Input_RegA.instrn.decode_LOAD())
+	{
+	A_dest_regs = 1;
+	strcpy(A_Dest, ID_Input_RegA.instrn.load_field.dest_reg);
+	}
+
+  else if (ID_Input_RegA.instrn.decode_MOVE())
+	{
+	A_dest_regs = 1;
+	strcpy(A_Dest, ID_Input_RegA.instrn.move_field.dest_reg);
+	}
+
+  else if (ID_Input_RegA.instrn.decode_ALU())
+	{
+	A_dest_regs = 1;
+	strcpy(A_Dest, ID_Input_RegA.instrn.alu_field.dest_reg);
+	}
+
+  else if (ID_Input_RegA.instrn.decode_ALUI())
+	{
+	A_dest_regs = 1;
+	strcpy(A_Dest, ID_Input_RegA.instrn.alui_field.dest_reg);
+	}
+
+  else if (ID_Input_RegA.instrn.decode_FLPT())
+	{
+	A_dest_regs = 1;
+	strcpy(A_Dest, ID_Input_RegA.instrn.alu_field.dest_reg);
+	}
+  else if (((ID_Input_RegA.instrn.function == t_dlx_instrn_set::JAL)
+         || (ID_Input_RegA.instrn.function == t_dlx_instrn_set::JALR)) && FirstCycle)
+	{A_dest_regs = 1;}
+  else
+	A_dest_regs = 0;
+
+  if (A_dest_regs == 1)
+   {
+    SetA_DestBusy = true;
+    if (((ID_Input_RegA.instrn.function == t_dlx_instrn_set::JAL)
+      || (ID_Input_RegA.instrn.function == t_dlx_instrn_set::JALR)) && FirstCycle)
+     {
+      A_destT = 'R';
+      A_dest  = 31;
+     }
+    else
+     {
+      dest_args = Decode_Register(A_Dest);
+      A_destT = dest_args.type;
+      A_dest  = dest_args.number;
+      if ((A_destT == 'R') && (myReg->Rbusy(A_dest) == 1)) //check if R type busy
+	{mySB->setWAW_A( A_destT, A_dest);	// drives display in Scoreboard
+         Hazard_A= true;}
+//      if ((A_destT == 'F') && (myReg->Fbusy(A_dest) == 1)) //check if F type busy
+//	{mySB->setWAW_A( A_destT, A_dest);
+//	 Hazard_A = true;}
+     }
+    }
+
+// check if RAW1 is clear
+
+  if (ID_Input_RegA.instrn.decode_LOAD())
+
+// Source register content (= source base address) is sent to Integer Unit
+// as data1, Integer Unit decodes offset from the instruction and adds it
+// to data1 to form the memory address.
+
+	{
+	 A_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegA.instrn.load_field.src);
+	}
+
+   else if (ID_Input_RegA.instrn.decode_STORE())
+
+// Destination register content (= destination base address) is sent to
+// Integer Unit as data1. (The source register operand is sent as data2.)
+// Integer Unit decodes offset from the instruction and adds it to data1
+// to form the memory address.
+
+	{
+	 A_source_regs = 2;
+	 strcpy(Source1, ID_Input_RegA.instrn.store_field.dest);
+	}
+
+  else if (ID_Input_RegA.instrn.decode_MOVE())
+
+	{
+	 A_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegA.instrn.move_field.src_reg);
+	}
+
+   else if (ID_Input_RegA.instrn.decode_ALU())
+	{
+	 A_source_regs = 2;
+	 strcpy(Source1, ID_Input_RegA.instrn.alu_field.src_reg1);
+	}
+
+   else if ((ID_Input_RegA.instrn.decode_ALUI())
+	 && (ID_Input_RegA.instrn.function != t_dlx_instrn_set::LHI))
+	{
+	 A_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegA.instrn.alui_field.src_reg1);
+	}
+
+   else if (ID_Input_RegA.instrn.decode_ALUP())
+	{
+	 A_source_regs = 2;
+ 	 strcpy(Source1, ID_Input_RegA.instrn.alup_field.src_reg1);
+	}
+
+   else if (ID_Input_RegA.instrn.decode_BRNC())
+	{
+	 A_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegA.instrn.brnc_field.src_reg);
+	}
+
+   else if (ID_Input_RegA.instrn.decode_JREG())
+	{
+	 A_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegA.instrn.jreg_field.src_reg);
+	}
+
+   else if (ID_Input_RegA.instrn.decode_FLPT())
+	{
+	 A_source_regs = 2;
+	 strcpy(Source1, ID_Input_RegA.instrn.alu_field.src_reg1);
+	}
+
+   else if (ID_Input_RegA.instrn.decode_COMP())
+	{
+	 A_source_regs = 2;
+	 strcpy(Source1, ID_Input_RegA.instrn.fpcp_field.src_reg1);
+	}
+
+   else
+	A_source_regs = 0;
+
+  if (A_source_regs >= 1)
+	{
+	src1_args = Decode_Register(Source1);
+	A_src1T  = src1_args.type;
+	A_src1  = src1_args.number;
+
+    if ((A_src1T == 'R') && (myReg->Rbusy(A_src1) == 1))
+	{mySB->setRAW1_A(A_src1T, A_src1);	// drives display in Scoreboard
+         Hazard_A = true;}
+
+//    if ((A_src1T == 'F') && (myReg->Fbusy(A_src1) == 1))
+//	{mySB->setRAW1_A(A_src1T, A_src1);
+//        Hazard_A = true;}
+	}	
+
+// if ALU or STORE function, check if RAW2 is clear
+
+   if (A_source_regs == 2)
+	{
+
+   if (ID_Input_RegA.instrn.decode_ALU())
+	{strcpy(Source2, ID_Input_RegA.instrn.alu_field.src_reg2);}
+
+   else if (ID_Input_RegA.instrn.decode_ALUP())
+	{strcpy(Source2, ID_Input_RegA.instrn.alup_field.src_reg2);}
+
+   else if (ID_Input_RegA.instrn.decode_FLPT())
+	{strcpy(Source2, ID_Input_RegA.instrn.alu_field.src_reg2);}
+
+   else if (ID_Input_RegA.instrn.decode_COMP())
+	{strcpy(Source2, ID_Input_RegA.instrn.fpcp_field.src_reg2);}
+
+   else if (ID_Input_RegA.instrn.decode_STORE())
+	{strcpy(Source2, ID_Input_RegA.instrn.store_field.src_reg);}
+
+  src2_args = Decode_Register(Source2);
+  A_src2T  = src2_args.type;
+  A_src2  = src2_args.number;
+
+    if ((A_src2T == 'R') && (myReg->Rbusy(A_src2) == 1))
+	{mySB->setRAW2_A(A_src2T, A_src2);	// drives display in Scoreboard
+	 Hazard_A = true;}
+
+//    if ((A_src2T == 'F') && (myReg->Fbusy(A_src2) == 1))
+//	{mySB->setRAW2_A(A_src2T, A_src2);
+//	 Hazard_A = true;}
+	}	// end of RAW2 check
+
+// CHANNEL B
+
+// check if WAW is clear
+
+  if (ID_Input_RegB.instrn.decode_LOAD())
+	{
+	B_dest_regs = 1;
+	strcpy(B_Dest, ID_Input_RegB.instrn.load_field.dest_reg);
+	}
+
+  else if (ID_Input_RegB.instrn.decode_MOVE())
+	{
+	B_dest_regs = 1;
+	strcpy(B_Dest, ID_Input_RegB.instrn.move_field.dest_reg);
+	}
+
+  else if (ID_Input_RegB.instrn.decode_ALU())
+	{
+	B_dest_regs = 1;
+	strcpy(B_Dest, ID_Input_RegB.instrn.alu_field.dest_reg);
+	}
+
+  else if (ID_Input_RegB.instrn.decode_ALUI())
+	{
+	B_dest_regs = 1;
+	strcpy(B_Dest, ID_Input_RegB.instrn.alui_field.dest_reg);
+	}
+
+  else if (ID_Input_RegB.instrn.decode_FLPT())
+	{
+	B_dest_regs = 1;
+	strcpy(B_Dest, ID_Input_RegB.instrn.alu_field.dest_reg);
+	}
+  else if (((ID_Input_RegB.instrn.function == t_dlx_instrn_set::JAL)
+         || (ID_Input_RegB.instrn.function == t_dlx_instrn_set::JALR)) && FirstCycle)
+	{B_dest_regs = 1;}
+  else
+	B_dest_regs = 0;
+
+  if (B_dest_regs == 1)
+   {
+    SetB_DestBusy = true;
+    if (((ID_Input_RegB.instrn.function == t_dlx_instrn_set::JAL)
+      || (ID_Input_RegB.instrn.function == t_dlx_instrn_set::JALR)) && FirstCycle)
+     {
+      B_destT = 'R';
+      B_dest  = 31;
+     }
+    else
+     {
+      dest_args = Decode_Register(B_Dest);
+      B_destT = dest_args.type;
+      B_dest  = dest_args.number;
+      if ((B_destT == 'R') && (myReg->Rbusy(B_dest) == 1)) //check if R type busy
+	{mySB->setWAW_B( B_destT, B_dest);	// drives display in Scoreboard
+         Hazard_B= true;}
+//      if ((B_destT == 'F') && (myReg->Fbusy(B_dest) == 1)) //check if F type busy
+//	{mySB->setWAW_B( B_destT, B_dest);
+//	 Hazard_B = true;}
+     }
+    }
+
+// check if RAW1 is clear
+
+  if (ID_Input_RegB.instrn.decode_LOAD())
+
+// Source register content (= source base address) is sent to Integer Unit
+// as data1, Integer Unit decodes offset from the instruction and adds it
+// to data1 to form the memory address.
+
+	{
+	 B_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegB.instrn.load_field.src);
+	}
+
+   else if (ID_Input_RegB.instrn.decode_STORE())
+
+// Destination register content (= destination base address) is sent to
+// Integer Unit as data1. (The source register operand is sent as data2.)
+// Integer Unit decodes offset from the instruction and adds it to data1
+// to form the memory address.
+
+	{
+	 B_source_regs = 2;
+	 strcpy(Source1, ID_Input_RegB.instrn.store_field.dest);
+	}
+
+  else if (ID_Input_RegB.instrn.decode_MOVE())
+
+	{
+	 B_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegB.instrn.move_field.src_reg);
+	}
+
+   else if (ID_Input_RegB.instrn.decode_ALU())
+	{
+	 B_source_regs = 2;
+	 strcpy(Source1, ID_Input_RegB.instrn.alu_field.src_reg1);
+	}
+
+   else if (ID_Input_RegB.instrn.decode_ALUI())
+//	 && (ID_Input_RegB.instrn.function != t_dlx_instrn_set::LHI))
+	{
+	 B_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegB.instrn.alui_field.src_reg1);
+	}
+
+   else if (ID_Input_RegB.instrn.decode_ALUP())
+	{
+	 B_source_regs = 2;
+ 	 strcpy(Source1, ID_Input_RegB.instrn.alup_field.src_reg1);
+	}
+
+   else if (ID_Input_RegB.instrn.decode_BRNC())
+	{
+	 B_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegB.instrn.brnc_field.src_reg);
+	}
+
+   else if (ID_Input_RegB.instrn.decode_JREG())
+	{
+	 B_source_regs = 1;
+	 strcpy(Source1, ID_Input_RegB.instrn.jreg_field.src_reg);
+	}
+
+   else if (ID_Input_RegB.instrn.decode_FLPT())
+	{
+	 B_source_regs = 2;
+	 strcpy(Source1, ID_Input_RegB.instrn.alu_field.src_reg1);
+	}
+
+   else if (ID_Input_RegB.instrn.decode_COMP())
+	{
+	 B_source_regs = 2;
+	 strcpy(Source1, ID_Input_RegB.instrn.fpcp_field.src_reg1);
+	}
+
+   else
+	B_source_regs = 0;
+
+  if (B_source_regs >= 1)
+	{
+	src1_args = Decode_Register(Source1);
+	B_src1T  = src1_args.type;
+	B_src1  = src1_args.number;
+
+    if ((B_src1T == 'R') && (myReg->Rbusy(B_src1) == 1))
+	{mySB->setRAW1_B(B_src1T, B_src1);	// drives display in Scoreboard
+         Hazard_B = true;}
+
+//    if ((B_src1T == 'F') && (myReg->Fbusy(B_src1) == 1))
+//	{mySB->setRAW1_B(B_src1T, B_src1);
+//         Hazard_B = true;}
+	}	
+
+// if ALU or STORE function, check if RAW2 is clear
+
+   if (B_source_regs == 2)
+	{
+
+   if (ID_Input_RegB.instrn.decode_ALU())
+	{strcpy(Source2, ID_Input_RegB.instrn.alu_field.src_reg2);}
+
+   else if (ID_Input_RegB.instrn.decode_ALUP())
+	{strcpy(Source2, ID_Input_RegB.instrn.alup_field.src_reg2);}
+
+   else if (ID_Input_RegB.instrn.decode_FLPT())
+	{strcpy(Source2, ID_Input_RegB.instrn.alu_field.src_reg2);}
+
+   else if (ID_Input_RegB.instrn.decode_COMP())
+	{strcpy(Source2, ID_Input_RegB.instrn.fpcp_field.src_reg2);}
+
+   else if (ID_Input_RegB.instrn.decode_STORE())
+	{strcpy(Source2, ID_Input_RegB.instrn.store_field.src_reg);}
+
+  src2_args = Decode_Register(Source2);
+  B_src2T  = src2_args.type;
+  B_src2  = src2_args.number;
+
+    if ((B_src2T == 'R') && (myReg->Rbusy(B_src2) == 1))
+	{mySB->setRAW2_B(B_src2T, B_src2);	// drives display in Scoreboard
+	 Hazard_B = true;}
+
+//    if ((B_src2T == 'F') && (myReg->Fbusy(B_src2) == 1))
+//	{mySB->setRAW2_B(B_src2T, B_src2);
+//	 Hazard_B = true;}
+	}	// end of Channel B RAW2 check
+
+	}	// end of valid = 1
+
+  // next check must proceed even if ID_Input_Reg is non-valid
+
+// Check for structural and control hazards i.e. whether execution units
+// can accept instruction.
+	// Needs a temporary packet, which is non-valid if instruction
+	// in ID_Input_Reg is non-valid or is set non-valid if instruction
+	// can't be sent to Execution Unit because of RAW or WAW,
+	// so that SB can insert a 0-latency instruction into latencyQ
+
+// CHANNEL A
+
+	 temp_buff1.instrn = ID_Input_RegA.instrn;
+	if (Hazard_A)
+	 {temp_buff1.status = 0;}
+	else
+	 {temp_buff1.status = ID_Input_RegA.status;}
+
+	Checkhaz = mySB->CheckHazards(temp_buff1);
+
+	if (Checkhaz == 0)
+	{
+	    mySB->setStrucHaz(0);	// drives display in Scoreboard
+	    mySB->setContHaz(0);	// drives display in Scoreboard
+	}
+
+        if ((Checkhaz & 1) == 1)
+	    {mySB->setStrucHaz(1);
+		Hazard_A = true;}	// set Hazard_A for structural hazard
+
+        if ((Checkhaz & 2)  == 2)
+	    {mySB->setContHaz(1);
+		Hazard_A = true;}	// set Hazard_A for control hazard
+
+// update scoreboard display
+//	mySB->Display();
+
+// CHANNEL B
+
+	 temp_buff1.instrn = ID_Input_RegB.instrn;
+	if (Hazard_B)
+	 {temp_buff1.status = 0;}
+	else
+	 {temp_buff1.status = ID_Input_RegB.status;}
+
+	Checkhaz = mySB->CheckHazards(temp_buff1);
+
+	if (Checkhaz == 0)
+	{
+	    mySB->setStrucHaz(0);	// drives display in Scoreboard
+	    mySB->setContHaz(0);	// drives display in Scoreboard
+	}
+
+        if ((Checkhaz & 1) == 1)
+	    {mySB->setStrucHaz(1);
+		Hazard_B = true;}	// set Hazard_B for structural hazard
+
+        if ((Checkhaz & 2)  == 2)
+	    {mySB->setContHaz(1);
+		Hazard_B = true;}	// set Hazard_B for control hazard
+
+// update scoreboard display
+	mySB->Display();
+
+// If valid instruction and hazard, set my_state = Held
+
+	if (((ID_Input_RegA.status  & 1) == 1) && (Hazard_A || Hazard_B))
+	  {
+	   my_state = ID_HELD;
+
+	  if (my_state != old_state)
+	    {dump_state();
+	     old_state = my_state;
+	    }
+	  }
+// If valid instruction and no hazards, assemble output
+
+	if ( ((ID_Input_RegA.status & 1) == 1)
+	     && !Hazard_A && !Hazard_B && !Hold)
+	 {
+
+// assemble operands
+
+// CHANNEL A
+
+    if (A_source_regs == 0)
+	{
+	  ID_OutputA.data1 = 0;	// set data1 = 0 
+	  ID_OutputA.data2 = 0;	// set data2 = 0
+				// for instructions which have no reg sources
+	}
+
+    if (A_source_regs >= 1)
+	{
+	if (A_src1T == 'R')	  {strcpy (read_src1.reg_type, "R");}
+	else			  {strcpy (read_src1.reg_type, "F");}
+	read_src1.reg_no = A_src1;
+	send_REG_READ(to_registersA1, read_src1);
+
+	 GET_NEXT(ev);		//wait for reply
+
+	if (ev.from_port(from_registersA1))
+	  {SIM_CAST(t_reg_value, src1_value, ev);
+	   ID_OutputA.data1 = src1_value.value;
+	   ID_OutputA.data2 = 0;}	// set data2 = 0 for instructions
+					// which only have 1 data value
+	}
+
+  if (A_source_regs == 2)
+	{
+	if (A_src2T == 'R')	  {strcpy (read_src2.reg_type, "R");}
+	else			  {strcpy (read_src2.reg_type, "F");}
+	read_src2.reg_no = A_src2;
+	send_REG_READ(to_registersA2, read_src2);
+
+	GET_NEXT(ev);		//wait for reply
+
+ // copy src2_value into output packet
+
+	if (ev.from_port(from_registersA2))
+	  {SIM_CAST(t_reg_value, src2_value, ev);
+	   ID_OutputA.data2 = src2_value.value;}
+	}
+
+// copy instruction and status into output register
+
+	ID_OutputA.instrn = ID_Input_RegA.instrn;
+	ID_OutputA.status = ID_Input_RegA.status;	
+
+
+
+// CHANNEL B
+
+    if (B_source_regs == 0)
+	{
+	  ID_OutputB.data1 = 0;	// set data1 = 0 
+	  ID_OutputB.data2 = 0;	// set data2 = 0
+				// for instructions which have no reg sources
+	}
+
+    if (B_source_regs >= 1)
+	{
+	if (B_src1T == 'R')	  {strcpy (read_src1.reg_type, "R");}
+	else			  {strcpy (read_src1.reg_type, "F");}
+	read_src1.reg_no = B_src1;
+	send_REG_READ(to_registersB1, read_src1);
+
+	 GET_NEXT(ev);		//wait for reply
+
+	if (ev.from_port(from_registersB1))
+	  {SIM_CAST(t_reg_value, src1_value, ev);
+	   ID_OutputB.data1 = src1_value.value;
+	   ID_OutputB.data2 = 0;}	// set data2 = 0 for instructions
+					// which only have 1 data value
+	}
+
+  if (B_source_regs == 2)
+	{
+	if (B_src2T == 'R')	  {strcpy (read_src2.reg_type, "R");}
+	else			  {strcpy (read_src2.reg_type, "F");}
+	read_src2.reg_no = B_src2;
+	send_REG_READ(to_registersB2, read_src2);
+
+	GET_NEXT(ev);		//wait for reply
+
+ // copy src2_value into output packet
+
+	if (ev.from_port(from_registersB2))
+	  {SIM_CAST(t_reg_value, src2_value, ev);
+	   ID_OutputB.data2 = src2_value.value;}
+	}
+
+// copy instruction and status into output register
+
+	ID_OutputB.instrn = ID_Input_RegB.instrn;
+	ID_OutputB.status = ID_Input_RegB.status;	
+
+	 }	// closes Hazard = 0
+
+// set IDHeld (read by IF at start of ClockPhase 1)
+// and send DONE signal to clock
+
+	IDHeld = Hazard_A | Hazard_B ;
+
+		// end of ClockPhase 0
+
+$phase1
+
+	Hold = myMA->MAHeld_A | myMA->MAHeld_B;
+
+	if ((SetClearValid) && (!DelaySlot))
+		// don't clear if there's a valid delay slot instruction
+	 {ClearValid = true;
+	  SetClearValid = false;}
+
+	if (ClearValid)
+	 {ID_Input_RegA.status = 0;	// Invalidate input instruction
+	  ID_OutputA.status = 0;	// Invalidate output instruction
+	  mySB->clearHaz_A();	// Clear all hazards displayed in Scoreboard
+	  Hazard_A = false;
+	  ID_OutputB.status = 0;	// Invalidate output instruction
+	  mySB->clearHaz_B();	// Clear all hazards displayed in Scoreboard
+	  Hazard_B = false;
+	  Hazard = false;
+	 }
+
+
+// DEAL WITH OUTPUT
+	Hazard = Hazard_A | Hazard_B;
+
+    if (!Hold)
+	{
+	 if (((ID_OutputA.status & 1) == 1) && !Hazard_A && !Hazard_B)
+
+	  {
+	    send_UNIT_DATA(int_instr_outA, ID_OutputA);
+	    send_UNIT_DATA(int_instr_outB, ID_OutputB);
+	    DelaySlot = false;
+	  }
+	   else
+	    {Hazard =  true;}
+	  
+// if valid destination load instruction sent, set destination register busy
+// i.e. not including stores, branches and compares 
+// or in DLX-Pred, predicate compares
+
+// Channel A
+
+	if ( (((ID_Input_RegA.status & 1) == 1) && !Hazard_A && !Hazard_B)
+	   &&( (ID_Input_RegA.instrn.decode_LOAD())
+             ||(ID_Input_RegA.instrn.decode_MOVE())
+             ||(ID_Input_RegA.instrn.decode_ALU())
+             ||(ID_Input_RegA.instrn.decode_ALUI())
+             ||(ID_Input_RegA.instrn.decode_ALUI())
+	     )
+	   )
+	 {
+
+  if (ID_Input_RegA.instrn.decode_LOAD())
+	{strcpy(A_Dest, ID_Input_RegA.instrn.load_field.dest_reg);}
+
+  else if (ID_Input_RegA.instrn.decode_MOVE())
+	{strcpy(A_Dest, ID_Input_RegA.instrn.move_field.dest_reg);}
+
+  else if (ID_Input_RegA.instrn.decode_ALU())
+	{strcpy(A_Dest, ID_Input_RegA.instrn.alu_field.dest_reg);}
+
+  else if (ID_Input_RegA.instrn.decode_FLPT())
+	{strcpy(A_Dest, ID_Input_RegA.instrn.alu_field.dest_reg);}
+
+  A_destT = Decode_Register(A_Dest).type;
+  A_dest  = Decode_Register(A_Dest).number;
+
+	   if (A_destT == 'R') {strcpy (set_dest_busy_pkt.destT, "R");}
+	   else		     {strcpy (set_dest_busy_pkt.destT, "F");}
+	  set_dest_busy_pkt.dest = A_dest;
+	  sim_schedule(to_registersA1, 0.0, SET_DEST_BUSY,
+			SIM_PUT(set_dest_busy_struct, set_dest_busy_pkt));
+	 }
+
+// Channel B
+
+	if ( (((ID_Input_RegB.status & 1) == 1) && !Hazard_A && !Hazard_B)
+	   &&( (ID_Input_RegB.instrn.decode_LOAD())
+             ||(ID_Input_RegB.instrn.decode_MOVE())
+             ||(ID_Input_RegB.instrn.decode_ALU())
+             ||(ID_Input_RegB.instrn.decode_ALUI())
+             ||(ID_Input_RegB.instrn.decode_FLPT())
+	     )
+	   )
+	 {
+
+  if (ID_Input_RegB.instrn.decode_LOAD())
+	{strcpy(B_Dest, ID_Input_RegB.instrn.load_field.dest_reg);}
+
+  else if (ID_Input_RegB.instrn.decode_MOVE())
+	{strcpy(B_Dest, ID_Input_RegB.instrn.move_field.dest_reg);}
+
+  else if (ID_Input_RegB.instrn.decode_ALU())
+	{strcpy(B_Dest, ID_Input_RegB.instrn.alu_field.dest_reg);}
+
+  else if (ID_Input_RegB.instrn.decode_FLPT())
+	{strcpy(B_Dest, ID_Input_RegB.instrn.alu_field.dest_reg);}
+
+  B_destT = Decode_Register(B_Dest).type;
+  B_dest  = Decode_Register(B_Dest).number;
+
+	   if (B_destT == 'R') {strcpy (set_dest_busy_pkt.destT, "R");}
+	   else		     {strcpy (set_dest_busy_pkt.destT, "F");}
+	  set_dest_busy_pkt.dest = B_dest;
+	  sim_schedule(to_registersB1, 0.0, SET_DEST_BUSY,
+			SIM_PUT(set_dest_busy_struct, set_dest_busy_pkt));
+	 }
+
+	 }	// close Hold = 0 
+
+	// end of ClockPhase 1
+

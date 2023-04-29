@@ -1,0 +1,311 @@
+
+// Project:	DLX V4
+// Unit:	Instruction Fetch
+// File:	instr_fetch.hase
+// Date		6 Jan 2003
+
+// The Instruction Fetch Unit access the Memory Unit for instructions
+// using the address in a Prefetch Program Counter (PPC). PPC is
+// initially set equal to PC by the Memory Access Unit.
+// The IF Unit decodes branches in order to set the Delay Slot bit (29) for
+// the next instruction so that it doesn't increment PC when it gets to MA.
+// If the branch results in a change of PC (i.e. not a normal increment)
+// further instructions must be discarded until the first of the new
+// sequence arrives from memory (with bit 28 set).
+// has to be discarded. Because of the prefetching, there have to be
+// extra instructions (e.g. NOP 0) at the end of a program.
+
+// V2 has an improved memory interface using the sim_waiting and sim_select
+// commands to allow for multi-cycle memory access times
+
+// V1.1 (Nov 2001) uses the new clock mechanism and uses
+// the sim_from_port predicate to check for a new packet, rather than always
+// receiving a packet. This avoids the need to send untraced packets when
+// there is no valid instruction.
+
+// V4 has two channels/
+
+$class_decls
+
+//entity references
+  sim_entity_id pipe;
+  sim_entity_id memory;
+  sim_entity_id m_access;
+
+  instr_decode * myID;
+  mem_access * myMA;
+
+//structures and variables
+  t_i_mem_access InstrMemRequest;
+  t_instrn_reg IF_Input_RegA, IF_Input_RegB;
+  t_instrn_reg InputPacket, InputPacket2;
+  t_instrn_reg IF_OutputA, IF_OutputB;
+  t_dlx_instrn_set Instruction;
+  t_branch_rslt BranchResult;
+
+  bool Jump, branch_error;
+  pc_struct next_PPC;
+  bool PPC_init, SetPPC_init;	// used to ensure that no instruction accesses
+				// occur until PPC has been set from PC
+  int ClearValid, SetClearValid;
+
+  int branch_address;
+  int target_address;
+  int branch_status;
+  int MemReqOutstanding;
+  int NewSequence; // = 8 if instruction fetch is to start of new sequence
+  bool Hold;
+  int old_state, old_PPC;
+
+
+//classes
+  void InitialisePC(pc_struct PC);
+  void ClearPipe();
+$class_defs
+
+void instr_fetch::InitialisePC(pc_struct PC)
+
+		// Invoked by Memory Access during initialisation
+		// Updates PPC with new value of PC
+{
+  strcpy(next_PPC.label, PC.label);
+  next_PPC.offset = PC.offset;
+  SetPPC_init = true;
+}
+
+void instr_fetch::ClearPipe()	// invoked by MA at a branch
+{
+  SetClearValid = 1;	// sets ClearValid in ClockPhase 1; ClearValid is
+			// reset by first instruction of a new sequence
+}
+
+$pre
+
+  pipe = sim.get_entity_id("PIPE_DISP");
+  m_access = sim.get_entity_id("MEM_ACCESS");
+
+ myID = (instr_decode*)sim.get_entity(sim.get_entity_id("INSTR_DECODE"));
+ myMA = (mem_access*)sim.get_entity(m_access);
+
+ branch_error = false;
+ SetPPC_init = false;
+ PPC_init = false;
+ old_PPC = 0;
+ MemReqOutstanding = 0;
+ ClearValid = 1; // initially set, awaiting initialisation of PPC by MA Unit
+ SetClearValid = 1;
+ NewSequence = 0; // = 8 if instruction fetch is to start of new sequence
+ Hold = false;
+ IF_Input_RegA.status = 0;
+ IF_OutputA.status = 0;
+ IF_OutputA.instrn.reset();
+ IF_OutputB.status = 0;
+ IF_OutputB.instrn.reset();
+ my_state = IF_VOID;
+ old_state = IF_VOID;
+ dump_state();
+
+$phase0
+
+// predicates for use in sim_waiting test
+
+  sim_from_port mem_packet(from_memory_0);
+  sim_from_port mem_packet2(from_memory_1);	   
+  sim_from_port pc_packet(new_pc_in);
+
+
+
+// Normal PPC update
+
+  strcpy(PPC.label, next_PPC.label);
+  PPC.offset = next_PPC.offset;
+
+// PPC update if there's a packet from the MA Unit
+
+	if (sim_waiting(pc_packet) > 0)
+	{
+	 sim_select (pc_packet, ev);
+	 SIM_CAST( t_branch_rslt, BranchResult, ev);
+	 branch_address = BranchResult.branch;	// not used yet
+	 branch_status  = BranchResult.status;
+	 strcpy(PPC.label, BranchResult.addr.label);
+	 PPC.offset = BranchResult.addr.offset;
+	 strcpy(next_PPC.label, PPC.label);
+	 next_PPC.offset = PPC.offset; // to ensure that PPC remains
+					// = target address if there's a Hold
+	 MemReqOutstanding = 0;		// all further replies will be ignored
+	 NewSequence = 8;
+	}
+
+// Check that IF is not held up by a Branch or external conditions;
+
+  if  (!Hold)
+	 {
+// Check for reply from memory and copy packet received into input register
+// Memory access time may be >1 clock
+
+// At a pipeline clear, ClearValid flag is set which says all instructions
+// are invalid until one is returned with bit 28 set indicating first of new
+// sequence. This bit is set with first request to memory after a clear
+// and resets ClearValid flag when it returns.
+
+	IF_Input_RegA.status = 0;	// initialise to non-valid
+	IF_Input_RegB.status = 0;
+	if ((sim_waiting(mem_packet) > 0) && (sim_waiting(mem_packet2) > 0))
+	 {
+	  sim_select(mem_packet, ev);
+	  SIM_CAST(t_instrn_reg, InputPacket, ev);
+	  IF_Input_RegA.instrn = InputPacket.instrn;
+	  IF_Input_RegA.status = InputPacket.status & -3;
+				// remove access type bit
+
+
+	  sim_select(mem_packet2, ev);
+	  SIM_CAST(t_instrn_reg, InputPacket2, ev);
+	  IF_Input_RegB.instrn = InputPacket2.instrn;
+	  IF_Input_RegB.status = InputPacket2.status & -3;
+				// remove access type bit	
+	
+	  if ((IF_Input_RegA.status & 9) == 9)	// bits 31 and 28 = 1
+	   {ClearValid = 0;}
+
+	  if (ClearValid == 0)
+	  {MemReqOutstanding --;} // decrement memory requests outstanding
+	 } // end of packet from memory
+
+	if (ClearValid == 1)
+	 {IF_Input_RegA.status = 0;
+	  IF_Input_RegB.status = 0;}
+
+	  if ( (IF_Input_RegA.status & 1) == 1 )	// valid instruction
+	   {
+
+// Decode input register content to look for branches. Branches are only
+// allowed in Channel A, so if Channel B contains a branch or jump,
+// stop simulation. If there's a branch in Channel A, channel B is
+// effecively a delay slot.
+
+	    if (   IF_Input_RegB.instrn.decode_JIMM()
+		|| IF_Input_RegB.instrn.decode_JREG()
+		|| IF_Input_RegB.instrn.decode_BRNC() 
+		|| IF_Input_RegB.instrn.decode_JIMM()
+		|| IF_Input_RegB.instrn.decode_JREG() )
+
+	       {branch_error = true;
+		stopSimulation(0);}
+
+// Decode absolute jumps to stop prefetching
+
+		if ( IF_Input_RegA.instrn.decode_JIMM()
+		  || IF_Input_RegA.instrn.decode_JREG() )
+		 {Jump = true;}
+	  }		// end of if valid instruction
+
+
+// If PPC has been initialised from PC and
+// if there are none or one memory requests outstanding, access memory for
+// next instruction and increment Pre-fetch Program Counter
+
+	if ((MemReqOutstanding <= 1)  && (PPC_init) && (!Jump))
+	{
+	  InstrMemRequest.status = 2 | NewSequence;
+	  strcpy(InstrMemRequest.addr.label, PPC.label);
+	  InstrMemRequest.addr.offset = PPC.offset;
+	  send_MEM_ACCESS_I(to_memory, InstrMemRequest);
+	  NewSequence = 0;
+	  MemReqOutstanding ++;	// increment memory requests outstanding
+	  next_PPC.offset = PPC.offset + 2;
+	  strcpy(next_PPC.label, PPC.label);
+
+	}
+	}		// end of IF not held up
+
+
+// set state
+
+	if ((IF_Input_RegA.status & 1) == 0)
+	 {my_state = IF_VOID;}
+
+	if (((IF_Input_RegA.status & 1) == 1) && !Hold)
+	 {my_state = IF_BUSY;}
+
+	if (((IF_Input_RegA.status & 1) == 1) && Hold)
+	 {my_state = IF_HELD;}
+
+	  if ((my_state != old_state) || (old_PPC != PPC.offset))
+	   {dump_state();
+	    old_state = my_state;
+	    old_PPC = PPC.offset;}
+
+// send packets to pipe_disp
+
+	sim_schedule(pipe, 0.0, INSTRUCTION,
+			SIM_PUT(t_instrn_reg, IF_Input_RegA));
+	sim_schedule(pipe, 0.0, INSTRUCTION,
+			SIM_PUT(t_instrn_reg, IF_Input_RegB));
+	
+
+
+// ASSEMBLE OUTPUT
+// copy Input Register into output packet
+
+	IF_OutputA.instrn = IF_Input_RegA.instrn;
+	IF_OutputA.status = IF_Input_RegA.status;
+	IF_OutputB.instrn = IF_Input_RegB.instrn;
+	IF_OutputB.status = IF_Input_RegB.status;
+
+
+	// end of ClockPhase = 0
+
+$phase1
+
+	Hold = myMA->MAHeld_A | myMA->MAHeld_A
+	     | myID->IDHeld;
+;
+
+
+	if (SetPPC_init)		// initialisation
+	 {PPC_init = true;
+	  NewSequence = 8;
+	  SetPPC_init = false;}
+
+	if (SetClearValid == 1)		// pipeline clear
+	 { ClearValid = 1;
+	   SetClearValid = 0;
+	   Jump = false;
+	 }
+
+	if (ClearValid == 1)
+	 {IF_Input_RegA.status  = 0;
+	 IF_OutputA.status  = 0;
+	 IF_OutputB.status  = 0;
+
+	 }
+
+
+// Send Output to Instruction Decode
+
+// If IFHold is set, do not send any instructions to Instruction Decode
+// unless ClearValid is set (after a branch)
+
+	if (!Hold || (ClearValid == 1))
+	 {
+	  if ((IF_OutputA.status & 1) == 1)
+	   {send_INSTRUCTION(instr_outA, IF_OutputA);
+	    send_INSTRUCTION(instr_outB, IF_OutputB);
+	   }
+	  }
+	// end of Clockphase 1
+
+$report
+
+  if(branch_error)
+   {printf("Simulation aborted: a branch or jump in Channel B is not permitted\n");}
+
+
+
+
+
+
+
+
